@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net/url"
 	"sync"
 	"time"
 
@@ -44,7 +43,7 @@ type GeometricTxManager struct {
 	mu sync.Mutex
 
 	ethClient eth.Client
-	gasOracle gasoracle.GasOracle
+	gasOracle *gasoracle.GasOracle
 	wallet    wallet.Wallet
 	logger    logging.Logger
 	metrics   *Metrics
@@ -96,7 +95,7 @@ func fillParamsWithDefaultValues(params *GeometricTxnManagerParams) {
 
 func NewGeometricTxnManager(
 	ethClient eth.Client,
-	gasOracle gasoracle.GasOracle,
+	gasOracle *gasoracle.GasOracle,
 	wallet wallet.Wallet,
 	logger logging.Logger,
 	metrics *Metrics,
@@ -141,7 +140,8 @@ func (t *GeometricTxManager) Send(ctx context.Context, tx *types.Transaction) (*
 	return t.processTransaction(ctx, newTxnRequest(tx))
 }
 
-// ProcessTransaction sends the transaction and runs the monitoring loop which will bump the gasPrice until the tx get included.
+// ProcessTransaction sends the transaction and runs the monitoring loop which will bump the gasPrice until the tx get
+// included.
 func (t *GeometricTxManager) processTransaction(ctx context.Context, req *txnRequest) (*types.Receipt, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -165,18 +165,14 @@ func (t *GeometricTxManager) processTransaction(ctx context.Context, req *txnReq
 		if err != nil {
 			return nil, fmt.Errorf("failed to get sender address: %w", err)
 		}
-		txn, err = t.gasOracle.UpdateGas(ctx, req.tx, req.tx.Value(), gasTipCap, gasFeeCap, from)
+		txn, err = t.gasOracle.UpdateGasParams(ctx, req.tx, gasTipCap, gasFeeCap, from)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update gas price: %w", err)
 		}
 		txID, err = t.wallet.SendTransaction(ctx, txn)
 		// TODO: what is this...? does it come from the fireblocks wallet?
-		var urlErr *url.Error
-		didTimeout := false
-		if errors.As(err, &urlErr) {
-			didTimeout = urlErr.Timeout()
-		}
-		if didTimeout || errors.Is(err, context.DeadlineExceeded) {
+		var timeout interface{ Timeout() bool }
+		if errors.As(err, &timeout); timeout != nil && timeout.Timeout() {
 			t.logger.Warn(
 				"failed to send txn due to timeout",
 				"hash",
@@ -282,7 +278,8 @@ func (t *GeometricTxManager) ensureAnyTransactionConfirmed(
 				}
 			}
 
-			// TODO(samlaf): how to maintain these better? How do we know which errors to use and where they are returned from?
+			// TODO(samlaf): how to maintain these better? How do we know which errors to use and where they are
+			// returned from?
 			if errors.Is(err, ethereum.NotFound) || errors.Is(err, wallet.ErrReceiptNotYetAvailable) {
 				t.logger.Debug("Transaction not yet mined", "txID", txID, "txHash", tx.Hash().Hex(), "err", err)
 			} else if errors.Is(err, wallet.ErrTransactionFailed) {
@@ -485,7 +482,7 @@ func (t *GeometricTxManager) speedUpTxn(
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sender address: %w", err)
 	}
-	return t.gasOracle.UpdateGas(ctx, tx, tx.Value(), newGasTipCap, newGasFeeCap, from)
+	return t.gasOracle.UpdateGasParams(ctx, tx, newGasTipCap, newGasFeeCap, from)
 }
 
 // increaseGasPrice increases the gas price by specified percentage.
