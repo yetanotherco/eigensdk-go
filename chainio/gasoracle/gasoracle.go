@@ -8,8 +8,6 @@ import (
 	"github.com/Layr-Labs/eigensdk-go/logging"
 	"github.com/Layr-Labs/eigensdk-go/utils"
 	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
@@ -20,7 +18,7 @@ type Params struct {
 	GasTipMultiplierPercentage uint64
 }
 
-var DefaultParams = Params{
+var defaultParams = Params{
 	FallbackGasTipCap:          uint64(5_000_000_000), // 5 gwei
 	GasMultiplierPercentage:    uint64(120),           // add an extra 20% gas buffer to the gas limit
 	GasTipMultiplierPercentage: uint64(125),           // add an extra 25% to the gas tip
@@ -35,13 +33,13 @@ type GasOracle struct {
 // params are optional gas parameters any of which will be filled with default values if not provided
 func New(client eth.Client, logger logging.Logger, params Params) *GasOracle {
 	if params.FallbackGasTipCap == 0 {
-		params.FallbackGasTipCap = DefaultParams.FallbackGasTipCap
+		params.FallbackGasTipCap = defaultParams.FallbackGasTipCap
 	}
 	if params.GasMultiplierPercentage == 0 {
-		params.GasMultiplierPercentage = DefaultParams.GasMultiplierPercentage
+		params.GasMultiplierPercentage = defaultParams.GasMultiplierPercentage
 	}
 	if params.GasTipMultiplierPercentage == 0 {
-		params.GasTipMultiplierPercentage = DefaultParams.GasTipMultiplierPercentage
+		params.GasTipMultiplierPercentage = defaultParams.GasTipMultiplierPercentage
 	}
 	return &GasOracle{
 		params: params,
@@ -50,6 +48,7 @@ func New(client eth.Client, logger logging.Logger, params Params) *GasOracle {
 	}
 }
 
+// TODO: should this be part of the public API?
 func (o *GasOracle) GetLatestGasCaps(ctx context.Context) (gasTipCap, gasFeeCap *big.Int, err error) {
 	gasTipCap, err = o.client.SuggestGasTipCap(ctx)
 	if err != nil {
@@ -67,47 +66,53 @@ func (o *GasOracle) GetLatestGasCaps(ctx context.Context) (gasTipCap, gasFeeCap 
 
 	header, err := o.client.HeaderByNumber(ctx, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, utils.WrapError("failed to get latest header", err)
 	}
 	gasFeeCap = getGasFeeCap(gasTipCap, header.BaseFee)
 	return
 }
 
-func (o *GasOracle) UpdateGas(
+// UpdateGasParams updates the three gas related parameters of a transaction:
+// gasTipCap, gasFeeCap, and gasLimit. It uses the provided gasTipCap and gasFeeCap
+// which could either come from o.GetLatestGasCaps, or be manually bumped by the caller,
+// and estimates the gas limit based on the transaction.
+// TODO: should we add a public method to also bump the gasTipCap and gasFeeCap, instead of forcing client to do it
+// themselves?
+func (o *GasOracle) UpdateGasParams(
 	ctx context.Context,
 	tx *types.Transaction,
-	value, gasTipCap, gasFeeCap *big.Int,
+	gasTipCap, gasFeeCap *big.Int,
 	from common.Address,
 ) (*types.Transaction, error) {
+
+	// we reestimate the gas limit because the state of the chain may have changed,
+	// which could cause the previous gas limit to be insufficient
 	gasLimit, err := o.client.EstimateGas(ctx, ethereum.CallMsg{
 		From:      from,
 		To:        tx.To(),
 		GasTipCap: gasTipCap,
 		GasFeeCap: gasFeeCap,
-		Value:     value,
+		Value:     tx.Value(),
 		Data:      tx.Data(),
 	})
 	if err != nil {
 		return nil, utils.WrapError("failed to estimate gas", err)
 	}
+	// we also add a buffer to the gas limit to account for potential changes in the state of the chain
+	// between the time of estimation and the time the transaction is mined
+	bufferedGasLimit := o.addGasBuffer(gasLimit)
 
-	noopSigner := func(addr common.Address, tx *types.Transaction) (*types.Transaction, error) {
-		return tx, nil
-	}
-	opts := &bind.TransactOpts{
-		From:   from,
-		Signer: noopSigner,
-		NoSend: true,
-	}
-	opts.Context = ctx
-	opts.Nonce = new(big.Int).SetUint64(tx.Nonce())
-	opts.GasTipCap = gasTipCap
-	opts.GasFeeCap = gasFeeCap
-	opts.GasLimit = o.addGasBuffer(gasLimit)
-	opts.Value = value
-
-	contract := bind.NewBoundContract(*tx.To(), abi.ABI{}, o.client, o.client, o.client)
-	return contract.RawTransact(opts, tx.Data())
+	return types.NewTx(&types.DynamicFeeTx{
+		ChainID:    tx.ChainId(),
+		Nonce:      tx.Nonce(),
+		GasTipCap:  gasTipCap,
+		GasFeeCap:  gasFeeCap,
+		Gas:        bufferedGasLimit,
+		To:         tx.To(),
+		Value:      tx.Value(),
+		Data:       tx.Data(),
+		AccessList: tx.AccessList(),
+	}), nil
 }
 
 func (o *GasOracle) addGasBuffer(gasLimit uint64) uint64 {
