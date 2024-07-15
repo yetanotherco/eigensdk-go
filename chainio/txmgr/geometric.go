@@ -18,7 +18,6 @@ import (
 )
 
 var (
-	hundred             = big.NewInt(100)
 	queryTickerDuration = 3 * time.Second
 )
 
