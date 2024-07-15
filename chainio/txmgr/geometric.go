@@ -565,7 +565,8 @@ func (t *GeometricTxManager) estimateGasTipCap(ctx context.Context) (gasTipCap *
 // The result is returned in a new big.Int to avoid modifying the input gasTipCap.
 func (t *GeometricTxManager) addGasTipCapBuffer(gasTipCap *big.Int) *big.Int {
 	bumpedGasTipCap := new(big.Int).Set(gasTipCap)
-	return bumpedGasTipCap.Mul(bumpedGasTipCap, big.NewInt(int64(t.params.GasTipMultiplierPercentage))).Div(bumpedGasTipCap, big.NewInt(100))
+	return bumpedGasTipCap.Mul(bumpedGasTipCap, big.NewInt(int64(t.params.GasTipMultiplierPercentage))).
+		Div(bumpedGasTipCap, big.NewInt(100))
 }
 
 // estimateGasFeeCap returns the gas fee cap for a transaction, calculated as:
