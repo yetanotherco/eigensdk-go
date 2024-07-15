@@ -8,12 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Layr-Labs/eigensdk-go/chainio/clients/eth"
 	"github.com/Layr-Labs/eigensdk-go/chainio/clients/wallet"
-	"github.com/Layr-Labs/eigensdk-go/chainio/gasoracle"
 	"github.com/Layr-Labs/eigensdk-go/logging"
+	"github.com/Layr-Labs/eigensdk-go/utils"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
@@ -38,12 +38,18 @@ type txnRequest struct {
 	txAttempts []*transaction
 }
 
+type EthBackend interface {
+	BlockNumber(ctx context.Context) (uint64, error)
+	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
+	EstimateGas(ctx context.Context, msg ethereum.CallMsg) (uint64, error)
+	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
+}
+
 type GeometricTxManager struct {
 	// FIXME: is this mutex still needed?
 	mu sync.Mutex
 
-	ethClient eth.Client
-	gasOracle *gasoracle.GasOracle
+	ethClient EthBackend
 	wallet    wallet.Wallet
 	logger    logging.Logger
 	metrics   *Metrics
@@ -68,14 +74,23 @@ type GeometricTxnManagerParams struct {
 	// percentage multiplier for gas price. It needs to be >= 10 to properly replace existing transaction
 	// e.g. 10 means 10% increase
 	gasPricePercentageMultiplier *big.Int
+	// default gas tip cap to use when eth_maxPriorityFeePerGas is not available
+	FallbackGasTipCap uint64
+	// percentage multiplier for gas limit. Should be >= 100
+	GasMultiplierPercentage uint64
+	// percentage multiplier for gas tip. Should be >= 100
+	GasTipMultiplierPercentage uint64
 }
 
 var defaultParams = GeometricTxnManagerParams{
-	confirmationBlocks:           0,                    // tx mined is considered confirmed
-	txnBroadcastTimeout:          2 * time.Minute,      // fireblocks has had issues so we give it a long time
-	txnConfirmationTimeout:       5 * 12 * time.Second, // 5 blocks
-	maxSendTransactionRetry:      3,                    // arbitrary
-	gasPricePercentageMultiplier: big.NewInt(10),       // 10%
+	confirmationBlocks:           0,                     // tx mined is considered confirmed
+	txnBroadcastTimeout:          2 * time.Minute,       // fireblocks has had issues so we give it a long time
+	txnConfirmationTimeout:       5 * 12 * time.Second,  // 5 blocks
+	maxSendTransactionRetry:      3,                     // arbitrary
+	gasPricePercentageMultiplier: big.NewInt(10),        // 10%
+	FallbackGasTipCap:            uint64(5_000_000_000), // 5 gwei
+	GasMultiplierPercentage:      uint64(120),           // add an extra 20% gas buffer to the gas limit
+	GasTipMultiplierPercentage:   uint64(125),           // add an extra 25% to the gas tip
 }
 
 func fillParamsWithDefaultValues(params *GeometricTxnManagerParams) {
@@ -91,11 +106,22 @@ func fillParamsWithDefaultValues(params *GeometricTxnManagerParams) {
 	if params.maxSendTransactionRetry == 0 {
 		params.maxSendTransactionRetry = defaultParams.maxSendTransactionRetry
 	}
+	if params.gasPricePercentageMultiplier == nil {
+		params.gasPricePercentageMultiplier = defaultParams.gasPricePercentageMultiplier
+	}
+	if params.FallbackGasTipCap == 0 {
+		params.FallbackGasTipCap = defaultParams.FallbackGasTipCap
+	}
+	if params.GasMultiplierPercentage == 0 {
+		params.GasMultiplierPercentage = defaultParams.GasMultiplierPercentage
+	}
+	if params.GasTipMultiplierPercentage == 0 {
+		params.GasTipMultiplierPercentage = defaultParams.GasTipMultiplierPercentage
+	}
 }
 
 func NewGeometricTxnManager(
-	ethClient eth.Client,
-	gasOracle *gasoracle.GasOracle,
+	ethClient EthBackend,
 	wallet wallet.Wallet,
 	logger logging.Logger,
 	metrics *Metrics,
@@ -104,7 +130,6 @@ func NewGeometricTxnManager(
 	fillParamsWithDefaultValues(&params)
 	return &GeometricTxManager{
 		ethClient: ethClient,
-		gasOracle: gasOracle,
 		wallet:    wallet,
 		logger:    logger.With("component", "GeometricTxManager"),
 		metrics:   metrics,
@@ -155,17 +180,16 @@ func (t *GeometricTxManager) processTransaction(ctx context.Context, req *txnReq
 	var txID wallet.TxID
 	var err error
 	retryFromFailure := 0
+	from, err := t.wallet.SenderAddress(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sender address: %w", err)
+	}
 	for retryFromFailure < t.params.maxSendTransactionRetry {
-		gasTipCap, gasFeeCap, err := t.gasOracle.GetLatestGasCaps(ctx)
+		gasTipCap, err := t.estimateGasTipCap(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get latest gas caps: %w", err)
+			return nil, fmt.Errorf("failed to estimate gas tip cap: %w", err)
 		}
-
-		from, err := t.wallet.SenderAddress(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get sender address: %w", err)
-		}
-		txn, err = t.gasOracle.UpdateGasParams(ctx, req.tx, gasTipCap, gasFeeCap, from)
+		txn, err = t.updateGasTipCap(ctx, req.tx, gasTipCap, from)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update gas price: %w", err)
 		}
@@ -441,67 +465,121 @@ func (t *GeometricTxManager) speedUpTxn(
 	ctx context.Context,
 	tx *types.Transaction,
 ) (*types.Transaction, error) {
-	prevGasTipCap := tx.GasTipCap()
-	prevGasFeeCap := tx.GasFeeCap()
-	// get the gas tip cap and gas fee cap based on current network condition
-	currentGasTipCap, currentGasFeeCap, err := t.gasOracle.GetLatestGasCaps(ctx)
-	if err != nil {
-		return nil, err
-	}
-	increasedGasTipCap := increaseGasPrice(prevGasTipCap, t.params.gasPricePercentageMultiplier)
-	increasedGasFeeCap := increaseGasPrice(prevGasFeeCap, t.params.gasPricePercentageMultiplier)
-	// make sure increased gas prices are not lower than current gas prices
-	var newGasTipCap, newGasFeeCap *big.Int
-	if currentGasTipCap.Cmp(increasedGasTipCap) > 0 {
-		newGasTipCap = currentGasTipCap
-	} else {
-		newGasTipCap = increasedGasTipCap
-	}
-	if currentGasFeeCap.Cmp(increasedGasFeeCap) > 0 {
-		newGasFeeCap = currentGasFeeCap
-	} else {
-		newGasFeeCap = increasedGasFeeCap
+	// bump the current gasTip, and also reestimate it from the node, and take the highest value
+	var newGasTipCap *big.Int
+	{
+		estimatedGasTipCap, err := t.estimateGasTipCap(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to estimate gas tip cap: %w", err)
+		}
+		bumpedGasTipCap := t.addGasTipCapBuffer(tx.GasTipCap())
+		if estimatedGasTipCap.Cmp(bumpedGasTipCap) > 0 {
+			newGasTipCap = estimatedGasTipCap
+		} else {
+			newGasTipCap = bumpedGasTipCap
+		}
 	}
 
-	t.logger.Info(
-		"increasing gas price",
-		"txHash",
-		tx.Hash().Hex(),
-		"nonce",
-		tx.Nonce(),
-		"prevGasTipCap",
-		prevGasTipCap,
-		"prevGasFeeCap",
-		prevGasFeeCap,
-		"newGasTipCap",
-		newGasTipCap,
-		"newGasFeeCap",
-		newGasFeeCap,
-	)
 	from, err := t.wallet.SenderAddress(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sender address: %w", err)
 	}
-	return t.gasOracle.UpdateGasParams(ctx, tx, newGasTipCap, newGasFeeCap, from)
+	newTx, err := t.updateGasTipCap(ctx, tx, newGasTipCap, from)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update gas price: %w", err)
+	}
+	t.logger.Info(
+		"increasing gas price",
+		"prevTxHash", tx.Hash().Hex(), "newTxHash", newTx.Hash().Hex(),
+		"nonce", tx.Nonce(),
+		"prevGasTipCap", tx.GasTipCap(), "newGasTipCap", newGasTipCap,
+		"prevGasFeeCap", tx.GasFeeCap(), "newGasFeeCap", newTx.GasFeeCap(),
+	)
+	return newTx, nil
 }
 
-// increaseGasPrice increases the gas price by specified percentage.
-// i.e. gasPrice + ((gasPrice * gasPricePercentageMultiplier + 99) / 100)
-func increaseGasPrice(gasPrice, gasPricePercentageMultiplier *big.Int) *big.Int {
-	if gasPrice == nil {
-		return nil
+// UpdateGasParams updates the three gas related parameters of a transaction:
+// - gasTipCap: calls the json-rpc method eth_maxPriorityFeePerGas and
+// adds a extra buffer based on o.params.GasTipMultiplierPercentage
+// - gasFeeCap: calculates the gas fee cap as 2 * baseFee + gasTipCap
+// - gasLimit: calls the json-rpc method eth_estimateGas and
+// adds a extra buffer based on o.params.GasMultiplierPercentage
+func (t *GeometricTxManager) updateGasTipCap(
+	ctx context.Context,
+	tx *types.Transaction,
+	newGasTipCap *big.Int,
+	from common.Address,
+) (*types.Transaction, error) {
+	gasFeeCap, err := t.estimateGasFeeCap(ctx, newGasTipCap)
+	if err != nil {
+		return nil, utils.WrapError("failed to estimate gas fee cap", err)
 	}
-	bump := new(big.Int).Mul(gasPrice, gasPricePercentageMultiplier)
-	bump = roundUpDivideBig(bump, hundred)
-	return new(big.Int).Add(gasPrice, bump)
+
+	// we reestimate the gas limit because the state of the chain may have changed,
+	// which could cause the previous gas limit to be insufficient
+	gasLimit, err := t.ethClient.EstimateGas(ctx, ethereum.CallMsg{
+		From:      from,
+		To:        tx.To(),
+		GasTipCap: newGasTipCap,
+		GasFeeCap: gasFeeCap,
+		Value:     tx.Value(),
+		Data:      tx.Data(),
+	})
+	if err != nil {
+		return nil, utils.WrapError("failed to estimate gas", err)
+	}
+	// we also add a buffer to the gas limit to account for potential changes in the state of the chain
+	// between the time of estimation and the time the transaction is mined
+	bufferedGasLimit := t.addGasBuffer(gasLimit)
+
+	return types.NewTx(&types.DynamicFeeTx{
+		ChainID:    tx.ChainId(),
+		Nonce:      tx.Nonce(),
+		GasTipCap:  newGasTipCap,
+		GasFeeCap:  gasFeeCap,
+		Gas:        bufferedGasLimit,
+		To:         tx.To(),
+		Value:      tx.Value(),
+		Data:       tx.Data(),
+		AccessList: tx.AccessList(),
+	}), nil
 }
 
-func roundUpDivideBig(a, b *big.Int) *big.Int {
-	if a == nil || b == nil || b.Cmp(big.NewInt(0)) == 0 {
-		return nil
+func (t *GeometricTxManager) estimateGasTipCap(ctx context.Context) (gasTipCap *big.Int, err error) {
+	gasTipCap, err = t.ethClient.SuggestGasTipCap(ctx)
+	if err != nil {
+		// If the transaction failed because the backend does not support
+		// eth_maxPriorityFeePerGas, fallback to using the default constant.
+		// Currently Alchemy is the only backend provider that exposes this
+		// method, so in the event their API is unreachable we can fallback to a
+		// degraded mode of operation. This also applies to our test
+		// environments, as hardhat doesn't support the query either.
+		// TODO: error could actually come from node not being down or network being slow, etc.
+		t.logger.Info("eth_maxPriorityFeePerGas is unsupported by current backend, using fallback gasTipCap")
+		gasTipCap = big.NewInt(0).SetUint64(t.params.FallbackGasTipCap)
 	}
-	one := new(big.Int).SetUint64(1)
-	num := new(big.Int).Sub(new(big.Int).Add(a, b), one) // a + b - 1
-	res := new(big.Int).Div(num, b)                      // (a + b - 1) / b
-	return res
+	return t.addGasTipCapBuffer(gasTipCap), nil
+}
+
+// addGasTipCapBuffer adds a buffer to the gas tip cap to account for potential changes in the state of the chain
+// The result is returned in a new big.Int to avoid modifying the input gasTipCap.
+func (t *GeometricTxManager) addGasTipCapBuffer(gasTipCap *big.Int) *big.Int {
+	bumpedGasTipCap := new(big.Int).Set(gasTipCap)
+	return bumpedGasTipCap.Mul(bumpedGasTipCap, big.NewInt(int64(t.params.GasTipMultiplierPercentage))).Div(bumpedGasTipCap, big.NewInt(100))
+}
+
+// estimateGasFeeCap returns the gas fee cap for a transaction, calculated as:
+// gasFeeCap = 2 * baseFee + gasTipCap
+// Rationale: https://www.blocknative.com/blog/eip-1559-fees
+// The result is returned in a new big.Int to avoid modifying gasTipCap.
+func (t *GeometricTxManager) estimateGasFeeCap(ctx context.Context, gasTipCap *big.Int) (*big.Int, error) {
+	header, err := t.ethClient.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return nil, utils.WrapError("failed to get latest header", err)
+	}
+	return new(big.Int).Add(new(big.Int).Mul(header.BaseFee, big.NewInt(2)), gasTipCap), nil
+}
+
+func (t *GeometricTxManager) addGasBuffer(gasLimit uint64) uint64 {
+	return t.params.GasMultiplierPercentage * gasLimit / 100
 }

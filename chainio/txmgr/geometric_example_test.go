@@ -9,7 +9,6 @@ import (
 
 	"github.com/Layr-Labs/eigensdk-go/chainio/clients/eth"
 	"github.com/Layr-Labs/eigensdk-go/chainio/clients/wallet"
-	"github.com/Layr-Labs/eigensdk-go/chainio/gasoracle"
 	"github.com/Layr-Labs/eigensdk-go/logging"
 	"github.com/Layr-Labs/eigensdk-go/signerv2"
 	"github.com/Layr-Labs/eigensdk-go/testutils"
@@ -71,7 +70,6 @@ func createTxMgr(rpcUrl string, ecdsaPrivateKey *ecdsa.PrivateKey) (eth.Client, 
 	if err != nil {
 		panic(err)
 	}
-	gasOracle := gasoracle.New(client, logger, gasoracle.Params{})
 	signerV2, signerAddr, err := signerv2.SignerFromConfig(signerv2.Config{PrivateKey: ecdsaPrivateKey}, chainid)
 	if err != nil {
 		panic(err)
@@ -82,5 +80,5 @@ func createTxMgr(rpcUrl string, ecdsaPrivateKey *ecdsa.PrivateKey) (eth.Client, 
 	}
 	reg := prometheus.NewRegistry()
 	metrics := NewMetrics(reg, "example", logger)
-	return client, NewGeometricTxnManager(client, gasOracle, wallet, logger, metrics, GeometricTxnManagerParams{})
+	return client, NewGeometricTxnManager(client, wallet, logger, metrics, GeometricTxnManagerParams{})
 }
