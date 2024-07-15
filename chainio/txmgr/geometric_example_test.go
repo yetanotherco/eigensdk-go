@@ -12,6 +12,7 @@ import (
 	"github.com/Layr-Labs/eigensdk-go/chainio/gasoracle"
 	"github.com/Layr-Labs/eigensdk-go/logging"
 	"github.com/Layr-Labs/eigensdk-go/signerv2"
+	"github.com/Layr-Labs/eigensdk-go/testutils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -19,11 +20,19 @@ import (
 )
 
 var (
-	rpcUrl  = "http://localhost:8545"
 	chainid = big.NewInt(31337)
 )
 
 func ExampleGeometricTxManager() {
+	anvilC, err := testutils.StartAnvilContainer("")
+	if err != nil {
+		panic(err)
+	}
+	anvilUrl, err := anvilC.Endpoint(context.TODO(), "http")
+	if err != nil {
+		panic(err)
+	}
+
 	ecdsaPrivateKey, err := crypto.HexToECDSA("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
 	if err != nil {
 		panic(err)
@@ -31,7 +40,7 @@ func ExampleGeometricTxManager() {
 	pk := ecdsaPrivateKey.PublicKey
 	address := crypto.PubkeyToAddress(pk)
 
-	client, txmgr := createTxMgr(ecdsaPrivateKey)
+	client, txmgr := createTxMgr(anvilUrl, ecdsaPrivateKey)
 
 	tx := createTx(client, address)
 	_, err = txmgr.Send(context.TODO(), tx)
@@ -56,7 +65,7 @@ func createTx(client eth.Client, address common.Address) *types.Transaction {
 	})
 }
 
-func createTxMgr(ecdsaPrivateKey *ecdsa.PrivateKey) (eth.Client, *GeometricTxManager) {
+func createTxMgr(rpcUrl string, ecdsaPrivateKey *ecdsa.PrivateKey) (eth.Client, *GeometricTxManager) {
 	logger := logging.NewTextSLogger(os.Stdout, &logging.SLoggerOptions{})
 	client, err := eth.NewClient(rpcUrl)
 	if err != nil {
