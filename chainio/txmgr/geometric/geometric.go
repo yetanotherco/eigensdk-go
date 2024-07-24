@@ -52,7 +52,7 @@ type GeometricTxManager struct {
 	ethClient EthBackend
 	wallet    wallet.Wallet
 	logger    logging.Logger
-	metrics   *Metrics
+	metrics   Metrics
 
 	// consts
 	params GeometricTxnManagerParams
@@ -60,25 +60,35 @@ type GeometricTxManager struct {
 
 var _ txmgr.TxManager = (*GeometricTxManager)(nil)
 
+// GeometricTxnManagerParams contains the parameters for the GeometricTxManager.
+// If a parameter is not set (aka its zero value is present in the struct), the default value will be used.
 type GeometricTxnManagerParams struct {
 	// number of blocks to wait for a transaction to be confirmed
+	// default: 0
 	confirmationBlocks int
 	// time to wait for a transaction to be broadcasted to the network
 	// could be direct via eth_sendRawTransaction or indirect via a wallet service such as fireblocks
+	// default: 2 minutes
 	txnBroadcastTimeout time.Duration
 	// time to wait for a transaction to be confirmed (mined + confirmationBlocks blocks)
+	// default: 5 * 12 seconds
 	txnConfirmationTimeout time.Duration
 	// max number of times to retry sending a transaction before failing
 	// this applies to every transaction attempt when a nonce is bumped
+	// default: 3
 	maxSendTransactionRetry int
 	// percentage multiplier for gas price. It needs to be >= 10 to properly replace existing transaction
 	// e.g. 10 means 10% increase
+	// default: 10
 	gasPricePercentageMultiplier *big.Int
 	// default gas tip cap to use when eth_maxPriorityFeePerGas is not available
+	// default: 5 gwei
 	FallbackGasTipCap uint64
 	// percentage multiplier for gas limit. Should be >= 100
+	// default: 120
 	GasMultiplierPercentage uint64
 	// percentage multiplier for gas tip. Should be >= 100
+	// default: 125
 	GasTipMultiplierPercentage uint64
 }
 
@@ -124,7 +134,7 @@ func NewGeometricTxnManager(
 	ethClient EthBackend,
 	wallet wallet.Wallet,
 	logger logging.Logger,
-	metrics *Metrics,
+	metrics Metrics,
 	params GeometricTxnManagerParams,
 ) *GeometricTxManager {
 	fillParamsWithDefaultValues(&params)
