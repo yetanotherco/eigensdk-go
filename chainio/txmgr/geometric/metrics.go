@@ -6,9 +6,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+type Metrics interface {
+	ObserveBroadcastLatencyMs(latencyMs int64)
+	ObserveConfirmationLatencyMs(latencyMs int64)
+	ObserveGasUsedWei(gasUsedWei uint64)
+	ObserveSpeedups(speedUps int)
+	IncrementProcessingTxCount()
+	DecrementProcessingTxCount()
+	IncrementProcessedTxsTotal(state string)
+}
+
 const namespace = "txmgr"
 
-type Metrics struct {
+type PromMetrics struct {
 	broadcastLatencyMs    prometheus.Summary
 	confirmationLatencyMs prometheus.Summary
 	gasUsedGwei           prometheus.Summary
@@ -17,9 +27,11 @@ type Metrics struct {
 	processedTxsTotal     *prometheus.CounterVec
 }
 
-func NewMetrics(reg prometheus.Registerer, subsystem string, logger logging.Logger) *Metrics {
+var _ Metrics = (*PromMetrics)(nil)
 
-	return &Metrics{
+func NewMetrics(reg prometheus.Registerer, subsystem string, logger logging.Logger) *PromMetrics {
+
+	return &PromMetrics{
 		// TODO: we only observe latency of txs that were successfully broadcasted or confirmed.
 		// We should also observe latency of txs that failed to broadcast or confirm.
 		broadcastLatencyMs: promauto.With(reg).NewSummary(
@@ -78,31 +90,53 @@ func NewMetrics(reg prometheus.Registerer, subsystem string, logger logging.Logg
 	}
 }
 
-func (t *Metrics) ObserveBroadcastLatencyMs(latencyMs int64) {
-	t.broadcastLatencyMs.Observe(float64(latencyMs))
+func (m *PromMetrics) ObserveBroadcastLatencyMs(latencyMs int64) {
+	m.broadcastLatencyMs.Observe(float64(latencyMs))
 }
 
-func (t *Metrics) ObserveConfirmationLatencyMs(latencyMs int64) {
-	t.confirmationLatencyMs.Observe(float64(latencyMs))
+func (m *PromMetrics) ObserveConfirmationLatencyMs(latencyMs int64) {
+	m.confirmationLatencyMs.Observe(float64(latencyMs))
 }
 
-func (t *Metrics) ObserveGasUsedWei(gasUsedWei uint64) {
+func (m *PromMetrics) ObserveGasUsedWei(gasUsedWei uint64) {
 	gasUsedGwei := gasUsedWei / 1e9
-	t.gasUsedGwei.Observe(float64(gasUsedGwei))
+	m.gasUsedGwei.Observe(float64(gasUsedGwei))
 }
 
-func (t *Metrics) ObserveSpeedups(speedUps int) {
-	t.speedUps.Observe(float64(speedUps))
+func (m *PromMetrics) ObserveSpeedups(speedUps int) {
+	m.speedUps.Observe(float64(speedUps))
 }
 
-func (t *Metrics) IncrementProcessingTxCount() {
-	t.processingTxCount.Inc()
+func (m *PromMetrics) IncrementProcessingTxCount() {
+	m.processingTxCount.Inc()
 }
 
-func (t *Metrics) DecrementProcessingTxCount() {
-	t.processingTxCount.Dec()
+func (m *PromMetrics) DecrementProcessingTxCount() {
+	m.processingTxCount.Dec()
 }
 
-func (t *Metrics) IncrementProcessedTxsTotal(state string) {
-	t.processedTxsTotal.WithLabelValues(state).Inc()
+func (m *PromMetrics) IncrementProcessedTxsTotal(state string) {
+	m.processedTxsTotal.WithLabelValues(state).Inc()
 }
+
+type NoopMetrics struct{}
+
+var _ Metrics = (*NoopMetrics)(nil)
+
+func NewNoopMetrics() *NoopMetrics {
+	return &NoopMetrics{}
+}
+
+func (t *NoopMetrics) ObserveBroadcastLatencyMs(latencyMs int64) {}
+
+func (t *NoopMetrics) ObserveConfirmationLatencyMs(latencyMs int64) {}
+
+func (t *NoopMetrics) ObserveGasUsedWei(gasUsedWei uint64) {}
+
+func (t *NoopMetrics) ObserveSpeedups(speedUps int) {}
+
+func (t *NoopMetrics) IncrementProcessingTxCount() {}
+
+func (t *NoopMetrics) DecrementProcessingTxCount() {}
+
+func (t *NoopMetrics) IncrementProcessedTxsTotal(state string) {}
