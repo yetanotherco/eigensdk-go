@@ -16,3 +16,7 @@ func NewEcdsaSkAndAddress() (*ecdsa.PrivateKey, common.Address, error) {
 	address := crypto.PubkeyToAddress(*pk.(*ecdsa.PublicKey))
 	return ecdsaSk, address, nil
 }
+
+func ZeroAddress() *common.Address {
+	return &common.Address{}
+}
